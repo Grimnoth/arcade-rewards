@@ -38,7 +38,7 @@ class LeaderboardData:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Arcade Rewards CSV processor")
     parser.add_argument("--season", required=True, help="Season tag, e.g. s10")
-    parser.add_argument("--eth-total", type=Decimal, required=False, default=None,
+    parser.add_argument("--eth-total", type=Decimal, required=True,
                         help="Total ETH to distribute across leaderboards")
     parser.add_argument("--eth-split", default="85:15",
                         help="Split between total:best in percent format, e.g. 85:15")
