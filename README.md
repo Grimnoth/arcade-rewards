@@ -19,7 +19,7 @@ pip install -r requirements.txt
 ### Usage
 Add your processing script(s) and run them, for example:
 ```bash
-python process_csvs.py
+python calculate_rewards.py --season s10 --eth-total 3.47 --eth-split 85:15 --min-credits 20 --input-dir weekly-input --config-dir config --output-dir .
 ```
 
 ### Notes
