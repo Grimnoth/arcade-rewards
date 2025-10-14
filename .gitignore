@@ -24,3 +24,6 @@ pip-wheel-metadata/
 # Project data
 weekly-input/
 sample-data/
+
+# Root-level CSVs only
+/*.csv
