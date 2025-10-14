@@ -52,6 +52,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--log-level", default="info", choices=["debug", "info", "warn"], help="Log verbosity")
     parser.add_argument("--eth-decimals", type=int, default=18, help="Decimal places for ETH output (default 18)")
     parser.add_argument("--eth-target-winners", type=int, default=None, help="Optional target number of ETH winners (post-merge)")
+    parser.add_argument("--xp-eligibility", choices=["min-credits", "all", "hybrid"], default="min-credits",
+                        help="Which wallets to include in XP: 'min-credits' (require min-credits, default), 'all' (ignore min-credits), or 'hybrid' (min-credits OR 0.001+ ETH spent with 1+ credit)")
+    parser.add_argument("--xp-scale", default="auto",
+                        help="Multiplier for XP total_score output. Use 'auto' to scale so minimum score = 100, or provide a number (default: auto)")
     return parser.parse_args()
 
 
@@ -432,15 +436,29 @@ def write_xp_output(
     total_runs: LeaderboardData,
     best_run: LeaderboardData,
     spend_eth: Dict[str, Decimal],
+    credits: Dict[str, Decimal],
     weights: Dict[str, Decimal],
     qualified_wallets: set,
+    xp_eligibility: str,
     wallet_case: Dict[str, str],
+    xp_scale: str,
+    min_credits: int,
 ) -> pathlib.Path:
     out_path = output_dir / f"{season}-xp-rewards-{date_tag}.csv"
 
     # Build union set of wallets that are qualified
     wallets = set(total_runs.value_by_wallet_lower.keys()) | set(best_run.value_by_wallet_lower.keys()) | set(spend_eth.keys())
-    wallets &= qualified_wallets
+    if xp_eligibility == "min-credits":
+        wallets &= qualified_wallets
+    elif xp_eligibility == "hybrid":
+        # Hybrid: qualified if (credits >= min_credits) OR (eth_spent >= 0.001 AND credits >= 1)
+        min_eth_threshold = Decimal("0.001")
+        hybrid_qualified = {
+            w for w in wallets
+            if credits.get(w, Decimal(0)) >= Decimal(min_credits) 
+            or (spend_eth.get(w, Decimal(0)) >= min_eth_threshold and credits.get(w, Decimal(0)) >= Decimal(1))
+        }
+        wallets &= hybrid_qualified
 
     # Aggregates
     sum_total_runs = sum(total_runs.value_by_wallet_lower.get(w, Decimal(0)) for w in wallets)
@@ -450,7 +468,7 @@ def write_xp_output(
     def safe_norm(val: Decimal, denom: Decimal) -> Decimal:
         return (val / denom) if denom > 0 else Decimal(0)
 
-    rows: List[Tuple[int, str, str, str, str, str]] = []
+    rows: List[Tuple[int, str, str, str, str, str, str]] = []
     scores: List[Tuple[str, Decimal]] = []
 
     for w in wallets:
@@ -467,6 +485,20 @@ def write_xp_output(
         )
         scores.append((w, total_score))
 
+    # Determine scale multiplier
+    if xp_scale.lower() == "auto":
+        # Auto-scale so minimum score = 100
+        min_score = min((score for _, score in scores if score > 0), default=Decimal(1))
+        if min_score > 0:
+            scale_multiplier = Decimal(100) / min_score
+        else:
+            scale_multiplier = Decimal(1)
+    else:
+        scale_multiplier = Decimal(xp_scale)
+    
+    # Apply scale to all scores
+    scores = [(w, score * scale_multiplier) for w, score in scores]
+
     # Rank by normalized total_score desc, tie-breaker by wallet asc
     scores.sort(key=lambda kv: (-kv[1], kv[0]))
 
@@ -474,6 +506,7 @@ def write_xp_output(
         v_total = total_runs.value_by_wallet_lower.get(w, Decimal(0))
         v_best = best_run.value_by_wallet_lower.get(w, Decimal(0))
         v_spend = spend_eth.get(w, Decimal(0))
+        v_credits = credits.get(w, Decimal(0))
         rows.append(
             (
                 rank_idx,
@@ -481,6 +514,7 @@ def write_xp_output(
                 f"{v_total}",
                 f"{v_best}",
                 f"{v_spend}",
+                f"{v_credits}",
                 # total_score should be normalized per user request
                 f"{total_score}",
             )
@@ -488,7 +522,7 @@ def write_xp_output(
 
     with out_path.open("w", newline="") as f:
         writer = csv.writer(f)
-        writer.writerow(["rank", "wallet_address", "cumulative_run_score", "best_run", "eth_spent", "total_score"])
+        writer.writerow(["rank", "wallet_address", "cumulative_run_score", "best_run", "eth_spent", "credits_used", "total_score"])
         writer.writerows(rows)
 
     return out_path
@@ -569,9 +603,13 @@ def main() -> None:
             total_board,
             best_board,
             spend_eth,
+            credits,
             xp_weights,
             qualified,
+            args.xp_eligibility,
             wallet_case,
+            args.xp_scale,
+            args.min_credits,
         )
 
     # Blacklist audit
