@@ -619,6 +619,8 @@ def write_xp_output(
         v_best = best_run.value_by_wallet_lower.get(w, Decimal(0))
         v_spend = spend_eth.get(w, Decimal(0))
         v_credits = credits.get(w, Decimal(0))
+        # Round total_score to integer (no decimal places)
+        rounded_score = int(total_score.to_integral_value(rounding=ROUND_HALF_UP))
         rows.append(
             (
                 rank_idx,
@@ -627,8 +629,7 @@ def write_xp_output(
                 f"{v_best}",
                 f"{v_spend}",
                 f"{v_credits}",
-                # total_score should be normalized per user request
-                f"{total_score}",
+                str(rounded_score),
             )
         )
 
