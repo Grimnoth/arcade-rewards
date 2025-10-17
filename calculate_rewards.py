@@ -50,7 +50,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--date", default=None, help="YYYYMMDD override for output filenames")
     parser.add_argument("--dry-run", action="store_true", help="Compute but do not write files")
     parser.add_argument("--log-level", default="info", choices=["debug", "info", "warn"], help="Log verbosity")
-    parser.add_argument("--eth-decimals", type=int, default=18, help="Decimal places for ETH output (default 18)")
+    parser.add_argument("--eth-decimals", type=int, default=4, help="Decimal places for ETH output (default 4)")
     parser.add_argument("--eth-target-winners", type=int, default=None, help="Optional target number of ETH winners (post-merge)")
     parser.add_argument("--xp-eligibility", choices=["min-credits", "all", "hybrid"], default="min-credits",
                         help="Which wallets to include in XP: 'min-credits' (require min-credits, default), 'all' (ignore min-credits), or 'hybrid' (min-credits OR 0.001+ ETH spent with 1+ credit)")
@@ -106,7 +106,7 @@ def read_blacklist(input_dir: pathlib.Path) -> List[str]:
 
 
 def audit_blacklist(output_dir: pathlib.Path, season: str, date_tag: str, removed_wallets: Iterable[str]) -> None:
-    audit_path = output_dir / f"{season}-blacklist-audit-{date_tag}.csv"
+    audit_path = output_dir / f"{season}_blacklist-audit_{date_tag}.csv"
     with audit_path.open("w", newline="") as f:
         writer = csv.writer(f)
         writer.writerow(["wallet"])
@@ -159,38 +159,46 @@ def detect_purchase_events(df: pd.DataFrame) -> Optional[Tuple[str, str]]:
     return None
 
 
+def find_file_by_patterns(input_dir: pathlib.Path, patterns: List[str]) -> Optional[pathlib.Path]:
+    """Find first file matching any of the given patterns in filename."""
+    for csv_path in sorted(input_dir.glob("*.csv")):
+        filename_lower = csv_path.name.lower()
+        for pattern in patterns:
+            if pattern in filename_lower:
+                return csv_path
+    return None
+
+
 def load_weekly_inputs(input_dir: pathlib.Path, log_level: str) -> Dict[str, pd.DataFrame]:
+    """Load weekly input files with explicit file type handling."""
     datasets: Dict[str, pd.DataFrame] = {}
-    for csv_path in input_dir.glob("*.csv"):
-        try:
-            df = pd.read_csv(csv_path)
-        except Exception:
+    
+    # Define explicit file patterns for each dataset type
+    file_specs = [
+        ("total_runs", ["total_run", "total-run", "cumulative"], detect_total_runs),
+        ("best_run", ["best_run", "best-run", "bestrun", "best_score"], detect_best_run),
+        ("credit_spend", ["credit", "spend"], detect_credit_spend),
+        ("purchase_events", ["purchase", "event"], detect_purchase_events),
+    ]
+    
+    # First pass: explicit filename-based detection
+    for dataset_name, patterns, validator_func in file_specs:
+        if dataset_name in datasets:
             continue
-        # Try detect each type
-        if "total_runs" not in datasets:
-            det = detect_total_runs(df)
-            if det:
-                datasets["total_runs"] = df
-                log("debug", f"Detected total_runs: {csv_path.name}", log_level)
-                continue
-        if "best_run" not in datasets:
-            det = detect_best_run(df)
-            if det:
-                datasets["best_run"] = df
-                log("debug", f"Detected best_run: {csv_path.name}", log_level)
-                continue
-        if "credit_spend" not in datasets:
-            det = detect_credit_spend(df)
-            if det:
-                datasets["credit_spend"] = df
-                log("debug", f"Detected credit_spend: {csv_path.name}", log_level)
-                continue
-        if "purchase_events" not in datasets:
-            det = detect_purchase_events(df)
-            if det:
-                datasets["purchase_events"] = df
-                log("debug", f"Detected purchase_events: {csv_path.name}", log_level)
-                continue
+            
+        csv_path = find_file_by_patterns(input_dir, patterns)
+        if csv_path:
+            try:
+                df = pd.read_csv(csv_path)
+                # Validate columns match expected structure
+                if validator_func(df):
+                    datasets[dataset_name] = df
+                    log("info", f"Loaded {dataset_name}: {csv_path.name}", log_level)
+                else:
+                    log("warn", f"File {csv_path.name} matched pattern but has unexpected columns for {dataset_name}", log_level)
+            except Exception as e:
+                log("warn", f"Failed to load {csv_path.name}: {e}", log_level)
+    
     return datasets
 
 
@@ -218,17 +226,33 @@ def df_to_leaderboard(df: pd.DataFrame, wallet_col: str, value_col: str, agg: st
 
 
 def load_and_prepare(inputs: Dict[str, pd.DataFrame], min_credits: int) -> Tuple[LeaderboardData, LeaderboardData, Dict[str, Decimal], Dict[str, str]]:
-    # Detect columns for each df
-    total_wallet_col, total_score_col = detect_total_runs(inputs["total_runs"])  # type: ignore
-    best_wallet_col, best_score_col = detect_best_run(inputs["best_run"])  # type: ignore
-    spend_wallet_col, spend_col = detect_credit_spend(inputs["credit_spend"])  # type: ignore
-
-    total_board = df_to_leaderboard(inputs["total_runs"], total_wallet_col, total_score_col, agg="sum")
-    best_board = df_to_leaderboard(inputs["best_run"], best_wallet_col, best_score_col, agg="max")
-
-    # Credits spent per wallet
+    """Process each input dataset distinctly into structured data."""
+    
+    # Process TOTAL RUNS leaderboard
+    total_df = inputs["total_runs"]
+    total_cols = detect_total_runs(total_df)
+    if not total_cols:
+        raise ValueError("total_runs file missing required columns")
+    total_wallet_col, total_score_col = total_cols
+    total_board = df_to_leaderboard(total_df, total_wallet_col, total_score_col, agg="sum")
+    
+    # Process BEST RUN leaderboard
+    best_df = inputs["best_run"]
+    best_cols = detect_best_run(best_df)
+    if not best_cols:
+        raise ValueError("best_run file missing required columns")
+    best_wallet_col, best_score_col = best_cols
+    best_board = df_to_leaderboard(best_df, best_wallet_col, best_score_col, agg="max")
+    
+    # Process CREDIT SPEND data
+    spend_df = inputs["credit_spend"]
+    spend_cols = detect_credit_spend(spend_df)
+    if not spend_cols:
+        raise ValueError("credit_spend file missing required columns")
+    spend_wallet_col, spend_col = spend_cols
+    
     credits: Dict[str, Decimal] = {}
-    for _, row in inputs["credit_spend"].iterrows():
+    for _, row in spend_df.iterrows():
         w = normalize_wallet(row.get(spend_wallet_col))
         v = to_decimal(row.get(spend_col))
         if w and v is not None:
@@ -240,16 +264,22 @@ def load_and_prepare(inputs: Dict[str, pd.DataFrame], min_credits: int) -> Tuple
     for w, orig in best_board.wallet_lower_to_original.items():
         wallet_case.setdefault(w, orig)
 
-    # Filter by min credits later within ranking/qualification step
     return total_board, best_board, credits, wallet_case
 
 
 def load_purchase_events(inputs: Dict[str, pd.DataFrame]) -> Dict[str, Decimal]:
+    """Process PURCHASE EVENTS data to extract ETH spending per wallet."""
     if "purchase_events" not in inputs:
         return {}
-    wallet_col, eth_col = detect_purchase_events(inputs["purchase_events"])  # type: ignore
+    
+    purchase_df = inputs["purchase_events"]
+    purchase_cols = detect_purchase_events(purchase_df)
+    if not purchase_cols:
+        raise ValueError("purchase_events file missing required columns")
+    
+    wallet_col, eth_col = purchase_cols
     spend: Dict[str, Decimal] = defaultdict(lambda: Decimal(0))
-    for _, row in inputs["purchase_events"].iterrows():
+    for _, row in purchase_df.iterrows():
         w = normalize_wallet(row.get(wallet_col))
         v = to_decimal(row.get(eth_col))
         if w and v is not None:
@@ -413,7 +443,7 @@ def finalize_eth_payouts(payouts: Dict[str, Decimal], target_total: Decimal, eth
 
 
 def write_eth_output(output_dir: pathlib.Path, season: str, date_tag: str, payouts: Dict[str, Decimal], wallet_case: Dict[str, str], eth_decimals: int, target_total: Decimal, target_winners: Optional[int]) -> pathlib.Path:
-    out_path = output_dir / f"{season}-eth-rewards-{date_tag}.csv"
+    out_path = output_dir / f"{season}_{target_total}_eth-rewards_{eth_decimals}decimals_{date_tag}.csv"
     finalized = finalize_eth_payouts(payouts, target_total=target_total, eth_decimals=eth_decimals, target_winners=target_winners)
     rows: List[Tuple[str, str]] = []
     for w_lower, _un, rounded_amt in finalized:
@@ -427,6 +457,88 @@ def write_eth_output(output_dir: pathlib.Path, season: str, date_tag: str, payou
         writer.writerow(["wallet", "payout"])
         writer.writerows(rows)
     return out_path
+
+
+def write_eth_audit(
+    output_dir: pathlib.Path,
+    season: str,
+    date_tag: str,
+    total_ranks: List[Tuple[str, Decimal]],
+    best_ranks: List[Tuple[str, Decimal]],
+    total_payouts: Dict[str, Decimal],
+    best_payouts: Dict[str, Decimal],
+    combined_payouts: Dict[str, Decimal],
+    wallet_case: Dict[str, str],
+    credits: Dict[str, Decimal],
+    bands: List[EthBand],
+    eth_total: Decimal,
+    eth_decimals: int,
+) -> pathlib.Path:
+    """Generate detailed audit report showing how each payout was calculated."""
+    audit_path = output_dir / f"{season}_{eth_total}_eth-rewards_{eth_decimals}decimals_{date_tag}_audit.csv"
+    
+    # Create rank lookups
+    total_rank_map = {wallet: (rank, score) for rank, (wallet, score) in enumerate(total_ranks, start=1)}
+    best_rank_map = {wallet: (rank, score) for rank, (wallet, score) in enumerate(best_ranks, start=1)}
+    
+    # Find which band each rank belongs to
+    def find_band(rank: int, leaderboard: str) -> str:
+        for band in bands:
+            if band.leaderboard == leaderboard and band.start_rank <= rank <= band.end_rank:
+                return f"{band.start_rank}-{band.end_rank}" if band.start_rank != band.end_rank else str(band.start_rank)
+        return "N/A"
+    
+    # Collect all wallets with payouts
+    all_wallets = set(combined_payouts.keys())
+    
+    rows = []
+    for wallet_lower in all_wallets:
+        total_rank, total_score = total_rank_map.get(wallet_lower, (None, Decimal(0)))
+        best_rank, best_score = best_rank_map.get(wallet_lower, (None, Decimal(0)))
+        
+        total_payout = total_payouts.get(wallet_lower, Decimal(0))
+        best_payout = best_payouts.get(wallet_lower, Decimal(0))
+        combined = combined_payouts.get(wallet_lower, Decimal(0))
+        wallet_credits = credits.get(wallet_lower, Decimal(0))
+        
+        total_band = find_band(total_rank, "total") if total_rank else "N/A"
+        best_band = find_band(best_rank, "best") if best_rank else "N/A"
+        
+        rows.append((
+            wallet_case.get(wallet_lower, wallet_lower),
+            str(combined),
+            str(total_rank) if total_rank else "N/A",
+            str(total_score) if total_score else "0",
+            total_band,
+            str(total_payout),
+            str(best_rank) if best_rank else "N/A",
+            str(best_score) if best_score else "0",
+            best_band,
+            str(best_payout),
+            str(wallet_credits),
+        ))
+    
+    # Sort by combined payout desc
+    rows.sort(key=lambda x: Decimal(x[1]), reverse=True)
+    
+    with audit_path.open("w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow([
+            "wallet",
+            "total_payout",
+            "total_runs_rank",
+            "total_runs_score",
+            "total_runs_band",
+            "total_runs_payout",
+            "best_run_rank",
+            "best_run_score",
+            "best_run_band",
+            "best_run_payout",
+            "credits_used"
+        ])
+        writer.writerows(rows)
+    
+    return audit_path
 
 
 def write_xp_output(
@@ -444,7 +556,7 @@ def write_xp_output(
     xp_scale: str,
     min_credits: int,
 ) -> pathlib.Path:
-    out_path = output_dir / f"{season}-xp-rewards-{date_tag}.csv"
+    out_path = output_dir / f"{season}_xp-rewards_{xp_eligibility}_{date_tag}.csv"
 
     # Build union set of wallets that are qualified
     wallets = set(total_runs.value_by_wallet_lower.keys()) | set(best_run.value_by_wallet_lower.keys()) | set(spend_eth.keys())
@@ -586,6 +698,23 @@ def main() -> None:
             wallet_case.setdefault(w, w)
         if not args.dry_run:
             eth_output_path = write_eth_output(output_dir, season, date_tag, all_payouts, wallet_case, args.eth_decimals, args.eth_total, args.eth_target_winners)
+            # Generate audit report
+            audit_path = write_eth_audit(
+                output_dir,
+                season,
+                date_tag,
+                total_ranks,
+                best_ranks,
+                total_payouts,
+                best_payouts,
+                all_payouts,
+                wallet_case,
+                credits,
+                eth_bands,
+                args.eth_total,
+                args.eth_decimals,
+            )
+            log("info", f"ETH audit report written: {audit_path}", log_level)
 
     # XP normalized output
     xp_weights = parse_xp_config(config_dir / "arcade-xp-payout-structure.csv")
