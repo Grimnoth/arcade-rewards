@@ -154,6 +154,9 @@ def find_file_by_patterns(input_dir: pathlib.Path, patterns: List[str]) -> Optio
     """Find first file matching any of the given patterns in filename."""
     for csv_path in sorted(input_dir.glob("*.csv")):
         filename_lower = csv_path.name.lower()
+        # Skip generated/joined files
+        if "join" in filename_lower or "audit" in filename_lower or "rewards" in filename_lower:
+            continue
         for pattern in patterns:
             if pattern in filename_lower:
                 return csv_path
@@ -342,16 +345,19 @@ def distribute_eth_for_leaderboard(
     bands: List[EthBand],
     target_leader: str,
     qualified: Optional[set] = None,
-) -> Dict[str, Decimal]:
+) -> Tuple[Dict[str, Decimal], Dict[str, Decimal]]:
     payouts: Dict[str, Decimal] = defaultdict(lambda: Decimal(0))
+    forfeit_amounts: Dict[str, Decimal] = {}
     if pool <= 0:
-        return payouts
+        return payouts, forfeit_amounts
     # Build map rank -> wallet
     rank_to_wallet: Dict[int, str] = {}
     for idx, (wallet, _) in enumerate(ranks, start=1):
         rank_to_wallet[idx] = wallet
 
     # First pass: collect wallets per band and active share sum
+    # NOTE: Include ALL wallets (qualified and unqualified) to calculate correct forfeit amounts
+    # Unqualified wallet payouts will be zeroed out later, and NOT redistributed
     active_bands: List[Tuple[EthBand, List[str]]] = []
     active_share = Decimal(0)
     for band in bands:
@@ -361,14 +367,14 @@ def distribute_eth_for_leaderboard(
         for r in range(band.start_rank, band.end_rank + 1):
             w = rank_to_wallet.get(r)
             if w is not None:
-                if qualified is None or w in qualified:
-                    recipients.append(w)
+                # Include ALL wallets, regardless of qualification status
+                recipients.append(w)
         if recipients:
             active_bands.append((band, recipients))
             active_share += band.share_fraction
 
     if active_share <= 0:
-        return payouts
+        return payouts, forfeit_amounts
 
     # Reallocate proportionally so that the entire pool is distributed among active bands
     for band, recipients in active_bands:
@@ -377,7 +383,16 @@ def distribute_eth_for_leaderboard(
         per_wallet = band_total / Decimal(len(recipients))
         for w in recipients:
             payouts[w] += per_wallet
-    return payouts
+    
+    # For unqualified wallets, track the forfeit amount before zeroing
+    # These amounts are NOT redistributed - they are forfeited
+    if qualified is not None:
+        for wallet in list(payouts.keys()):
+            if wallet not in qualified and payouts[wallet] > 0:
+                forfeit_amounts[wallet] = payouts[wallet]
+                payouts[wallet] = Decimal(0)
+    
+    return payouts, forfeit_amounts
 
 
 def finalize_eth_payouts(payouts: Dict[str, Decimal], target_total: Decimal, eth_decimals: int, target_winners: Optional[int]) -> List[Tuple[str, Decimal, Decimal]]:
@@ -434,7 +449,9 @@ def finalize_eth_payouts(payouts: Dict[str, Decimal], target_total: Decimal, eth
 
 
 def write_eth_output(output_dir: pathlib.Path, season: str, date_tag: str, payouts: Dict[str, Decimal], wallet_case: Dict[str, str], eth_decimals: int, target_total: Decimal, target_winners: Optional[int]) -> pathlib.Path:
-    out_path = output_dir / f"{season}_{target_total}_eth-rewards_{eth_decimals}decimals_{date_tag}.csv"
+    # Round target_total for filename display (4 decimals is enough)
+    display_total = float(target_total.quantize(Decimal("0.0001"), rounding=ROUND_HALF_UP))
+    out_path = output_dir / f"{season}_{display_total}_eth-rewards_{eth_decimals}decimals_{date_tag}.csv"
     finalized = finalize_eth_payouts(payouts, target_total=target_total, eth_decimals=eth_decimals, target_winners=target_winners)
     rows: List[Tuple[str, str]] = []
     for w_lower, _un, rounded_amt in finalized:
@@ -467,6 +484,10 @@ def write_eth_audit(
     total_ranks_pre_blacklist: List[Tuple[str, Decimal]],
     best_ranks_pre_blacklist: List[Tuple[str, Decimal]],
     blacklist: set,
+    qualified: set,
+    min_credits: int,
+    total_forfeits: Dict[str, Decimal],
+    best_forfeits: Dict[str, Decimal],
 ) -> pathlib.Path:
     """Generate detailed audit report showing how each payout was calculated, including blacklisted wallets."""
     audit_path = output_dir / f"{season}_{eth_total}_eth-rewards_{eth_decimals}decimals_{date_tag}_audit.csv"
@@ -508,30 +529,63 @@ def write_eth_audit(
     rows = []
     for wallet_lower in all_wallets:
         is_blacklisted = wallet_lower in blacklist
+        is_qualified = wallet_lower in qualified
+        wallet_credits = credits.get(wallet_lower, Decimal(0))
         
-        # Pre-blacklist data
+        # Skip blacklisted wallets with 0 credits (never played)
+        if is_blacklisted and wallet_credits == 0:
+            continue
+        
+        # Pre-blacklist data (get ranks first, needed for status determination)
         total_rank_pre, total_score = total_rank_map_pre.get(wallet_lower, (None, Decimal(0)))
         best_rank_pre, best_score = best_rank_map_pre.get(wallet_lower, (None, Decimal(0)))
         
-        # Post-blacklist data (only if not blacklisted)
+        # Determine status (will be updated later if forfeit amount is calculated)
         if is_blacklisted:
+            status = "BLACKLISTED"
+        elif not is_qualified and wallet_credits < Decimal(min_credits):
+            # Check if they're on any leaderboard
+            if total_rank_pre is None and best_rank_pre is None:
+                status = "NOT RANKED"
+            else:
+                status = f"< {min_credits} CREDITS"
+        else:
+            status = "QUALIFIED"
+        
+        # Post-blacklist data
+        if is_blacklisted:
+            # Blacklisted: removed from rankings
             total_rank_post = None
             best_rank_post = None
+        elif not is_qualified:
+            # Insufficient credits: stays at same rank (forfeit, don't bump up)
+            total_rank_post = total_rank_pre
+            best_rank_post = best_rank_pre
         else:
+            # Qualified: use post-blacklist rank (may have bumped up)
             total_rank_post, _ = total_rank_map.get(wallet_lower, (None, Decimal(0)))
             best_rank_post, _ = best_rank_map.get(wallet_lower, (None, Decimal(0)))
         
-        # Payouts (0 for blacklisted)
-        if is_blacklisted:
+        # Payouts (0 for blacklisted or unqualified)
+        if is_blacklisted or not is_qualified:
             total_payout = Decimal(0)
             best_payout = Decimal(0)
             combined = Decimal(0)
+            
+            # For insufficient credits, use the pre-calculated forfeit amount
+            if not is_blacklisted and not is_qualified and wallet_credits < Decimal(min_credits):
+                forfeit_from_total = total_forfeits.get(wallet_lower, Decimal(0))
+                forfeit_from_best = best_forfeits.get(wallet_lower, Decimal(0))
+                forfeited_combined = forfeit_from_total + forfeit_from_best
+                
+                if forfeited_combined > 0:
+                    # Update status to show forfeit amount
+                    forfeited_rounded = forfeited_combined.quantize(unit, rounding=ROUND_HALF_UP)
+                    status = f"< {min_credits} CREDITS (FORFEIT {forfeited_rounded})"
         else:
             total_payout = total_payouts.get(wallet_lower, Decimal(0))
             best_payout = best_payouts.get(wallet_lower, Decimal(0))
             combined = combined_payouts.get(wallet_lower, Decimal(0))
-        
-        wallet_credits = credits.get(wallet_lower, Decimal(0))
         
         # Round ETH amounts to specified decimal places
         total_payout_rounded = total_payout.quantize(unit, rounding=ROUND_HALF_UP)
@@ -559,7 +613,7 @@ def write_eth_audit(
         
         rows.append((
             wallet_case.get(wallet_lower, wallet_lower),
-            "YES" if is_blacklisted else "NO",
+            status,
             str(combined_rounded),
             total_rank_pre_str,
             total_rank_post_str,
@@ -575,39 +629,61 @@ def write_eth_audit(
             best_pre_rank,  # Add for sorting
         ))
     
-    # Sort non-blacklisted by payout first
-    non_blacklisted = [row for row in rows if row[1] == "NO"]
-    blacklisted = [row for row in rows if row[1] == "YES"]
+    # Separate into categories
+    blacklisted_rows: List = [row for row in rows if row[1] == "BLACKLISTED"]
+    forfeit_rows: List = [row for row in rows if "FORFEIT" in row[1]]  # < X CREDITS (FORFEIT Y)
+    regular_insufficient: List = [row for row in rows if row[1].startswith("< ") and "FORFEIT" not in row[1]]  # < X CREDITS (no forfeit)
+    not_ranked_rows: List = [row for row in rows if row[1] == "NOT RANKED"]
+    qualified_rows: List = [row for row in rows if row[1] == "QUALIFIED"]
     
-    # Sort non-blacklisted by payout desc
-    non_blacklisted.sort(key=lambda x: (-Decimal(x[2]) if x[2] != "0.0000" else Decimal(0), x[0]))
+    # Sort qualified by payout desc
+    qualified_rows.sort(key=lambda x: (-Decimal(x[2]) if x[2] != "0.0000" else Decimal(0), x[0]))
     
-    # For each blacklisted wallet, find where to insert it based on pre-blacklist rank
-    # Insert it right before the wallet that has a similar or worse pre-rank
+    # Sort blacklisted and forfeit by pre-rank (to weave them in)
+    blacklisted_by_rank = sorted(blacklisted_rows, key=lambda x: x[14])
+    forfeit_by_rank = sorted(forfeit_rows, key=lambda x: x[14])
+    
+    # Weave in blacklisted and forfeit wallets by their pre-rank
     result_rows = []
-    blacklisted_by_rank = sorted(blacklisted, key=lambda x: x[14])  # Sort blacklisted by their pre-rank
-    
     blacklisted_idx = 0
-    for row in non_blacklisted:
+    forfeit_idx = 0
+    
+    for row in qualified_rows:
+        current_pre_rank = row[14]
+        
         # Insert any blacklisted wallets that should appear before this row
         while blacklisted_idx < len(blacklisted_by_rank):
             bl_wallet = blacklisted_by_rank[blacklisted_idx]
-            bl_pre_rank = bl_wallet[14]
-            current_pre_rank = row[14]
-            
-            # If the blacklisted wallet had a better pre-rank, insert it before this row
-            if bl_pre_rank < current_pre_rank:
+            if bl_wallet[14] < current_pre_rank:
                 result_rows.append(bl_wallet)
                 blacklisted_idx += 1
             else:
                 break
         
+        # Insert any forfeit wallets that should appear before this row
+        while forfeit_idx < len(forfeit_by_rank):
+            ff_wallet = forfeit_by_rank[forfeit_idx]
+            if ff_wallet[14] < current_pre_rank:
+                result_rows.append(ff_wallet)
+                forfeit_idx += 1
+            else:
+                break
+        
         result_rows.append(row)
     
-    # Add any remaining blacklisted wallets at the end
+    # Add any remaining blacklisted and forfeit wallets
     while blacklisted_idx < len(blacklisted_by_rank):
         result_rows.append(blacklisted_by_rank[blacklisted_idx])
         blacklisted_idx += 1
+    while forfeit_idx < len(forfeit_by_rank):
+        result_rows.append(forfeit_by_rank[forfeit_idx])
+        forfeit_idx += 1
+    
+    # Add regular insufficient credit wallets at the end (by rank if they have one)
+    result_rows.extend(sorted(regular_insufficient, key=lambda x: (x[14] if x[14] != "N/A" else 999999, x[0])))
+    
+    # Add not ranked wallets at the very end (sorted by credits desc, then wallet asc)
+    result_rows.extend(sorted(not_ranked_rows, key=lambda x: (-Decimal(x[13]) if x[13] else Decimal(0), x[0])))
     
     # Remove the sorting helper column before writing
     rows = [row[:14] for row in result_rows]
@@ -616,7 +692,7 @@ def write_eth_audit(
         writer = csv.writer(f)
         writer.writerow([
             "wallet",
-            "blacklisted",
+            "status",
             "total_payout",
             "total_runs_rank_pre_blacklist",
             "total_runs_rank_post_blacklist",
@@ -785,18 +861,25 @@ def main() -> None:
     eth_output_path = None
     if args.eth_total is not None:
         total_pool, best_pool = split_eth_total(args.eth_total, args.eth_split)
-        total_payouts = distribute_eth_for_leaderboard(total_ranks, total_pool, eth_bands, target_leader="total", qualified=qualified)
-        best_payouts = distribute_eth_for_leaderboard(best_ranks, best_pool, eth_bands, target_leader="best", qualified=qualified)
-        # merge
+        total_payouts, total_forfeits = distribute_eth_for_leaderboard(total_ranks, total_pool, eth_bands, target_leader="total", qualified=qualified)
+        best_payouts, best_forfeits = distribute_eth_for_leaderboard(best_ranks, best_pool, eth_bands, target_leader="best", qualified=qualified)
+        # merge payouts
         all_payouts: Dict[str, Decimal] = defaultdict(lambda: Decimal(0))
         for d in (total_payouts, best_payouts):
             for w, amt in d.items():
                 all_payouts[w] += amt
+        # merge forfeits
+        all_forfeits: Dict[str, Decimal] = defaultdict(lambda: Decimal(0))
+        for d in (total_forfeits, best_forfeits):
+            for w, amt in d.items():
+                all_forfeits[w] += amt
         # Keep wallet_case updated for any wallet present only in payouts
         for w in list(all_payouts.keys()):
             wallet_case.setdefault(w, w)
         if not args.dry_run:
-            eth_output_path = write_eth_output(output_dir, season, date_tag, all_payouts, wallet_case, args.eth_decimals, args.eth_total, args.eth_target_winners)
+            # Calculate actual distributed amount (target minus forfeits)
+            actual_distributed = Decimal(sum(all_payouts.values()))
+            eth_output_path = write_eth_output(output_dir, season, date_tag, all_payouts, wallet_case, args.eth_decimals, actual_distributed, args.eth_target_winners)
             # Generate audit report
             audit_path = write_eth_audit(
                 output_dir,
@@ -815,6 +898,10 @@ def main() -> None:
                 total_ranks_pre_blacklist,
                 best_ranks_pre_blacklist,
                 blacklist_wallets,
+                qualified,
+                args.min_credits,
+                total_forfeits,
+                best_forfeits,
             )
             log("info", f"ETH audit report written: {audit_path}", log_level)
 
