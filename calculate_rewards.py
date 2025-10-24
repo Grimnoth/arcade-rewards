@@ -105,15 +105,6 @@ def read_blacklist(input_dir: pathlib.Path) -> List[str]:
     return sorted(set(wallets))
 
 
-def audit_blacklist(output_dir: pathlib.Path, season: str, date_tag: str, removed_wallets: Iterable[str]) -> None:
-    audit_path = output_dir / f"{season}_blacklist-audit_{date_tag}.csv"
-    with audit_path.open("w", newline="") as f:
-        writer = csv.writer(f)
-        writer.writerow(["wallet"])
-        for w in sorted(set(removed_wallets)):
-            writer.writerow([w])
-
-
 def detect_total_runs(df: pd.DataFrame) -> Optional[Tuple[str, str]]:
     # returns (wallet_col, score_col)
     cols = {c.lower(): c for c in df.columns}
@@ -851,10 +842,6 @@ def main() -> None:
             args.xp_scale,
             args.min_credits,
         )
-
-    # Blacklist audit
-    if not args.dry_run:
-        audit_blacklist(output_dir, season, date_tag, blacklist_wallets)
 
     # Reporting
     if eth_output_path:
