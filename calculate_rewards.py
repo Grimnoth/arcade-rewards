@@ -79,7 +79,7 @@ def to_decimal(value: object) -> Optional[Decimal]:
         return None
 
 
-def normalize_wallet(addr: str) -> Optional[str]:
+def normalize_wallet(addr: object) -> Optional[str]:
     if addr is None:
         return None
     s = str(addr).strip()
@@ -401,7 +401,7 @@ def finalize_eth_payouts(payouts: Dict[str, Decimal], target_total: Decimal, eth
     if target_winners is not None and len(items) > target_winners and total_unrounded > 0:
         kept = items[:target_winners]
         kept_sum = sum(amt for _, amt in kept)
-        scale = (total_unrounded / kept_sum) if kept_sum > 0 else Decimal(1)
+        scale: Decimal = Decimal(total_unrounded / kept_sum) if kept_sum > 0 else Decimal(1)
         items = [(w, amt * scale) for w, amt in kept]
         total_unrounded = sum(amt for _, amt in items)
     # Initial rounding
@@ -473,64 +473,123 @@ def write_eth_audit(
     bands: List[EthBand],
     eth_total: Decimal,
     eth_decimals: int,
+    total_ranks_pre_blacklist: List[Tuple[str, Decimal]],
+    best_ranks_pre_blacklist: List[Tuple[str, Decimal]],
+    blacklist: set,
 ) -> pathlib.Path:
-    """Generate detailed audit report showing how each payout was calculated."""
+    """Generate detailed audit report showing how each payout was calculated, including blacklisted wallets."""
     audit_path = output_dir / f"{season}_{eth_total}_eth-rewards_{eth_decimals}decimals_{date_tag}_audit.csv"
     
-    # Create rank lookups
+    # Create rank lookups for POST-blacklist rankings
     total_rank_map = {wallet: (rank, score) for rank, (wallet, score) in enumerate(total_ranks, start=1)}
     best_rank_map = {wallet: (rank, score) for rank, (wallet, score) in enumerate(best_ranks, start=1)}
+    
+    # Create rank lookups for PRE-blacklist rankings
+    total_rank_map_pre = {wallet: (rank, score) for rank, (wallet, score) in enumerate(total_ranks_pre_blacklist, start=1)}
+    best_rank_map_pre = {wallet: (rank, score) for rank, (wallet, score) in enumerate(best_ranks_pre_blacklist, start=1)}
     
     # Find which band each rank belongs to
     def find_band(rank: int, leaderboard: str) -> str:
         for band in bands:
             if band.leaderboard == leaderboard and band.start_rank <= rank <= band.end_rank:
-                return f"{band.start_rank}-{band.end_rank}" if band.start_rank != band.end_rank else str(band.start_rank)
+                if band.start_rank != band.end_rank:
+                    return f"{band.start_rank}-{band.end_rank}"
+                else:
+                    # Format single ranks with ordinal suffixes for 1, 2, 3
+                    if band.start_rank == 1:
+                        return "1st"
+                    elif band.start_rank == 2:
+                        return "2nd"
+                    elif band.start_rank == 3:
+                        return "3rd"
+                    else:
+                        return str(band.start_rank)
         return "N/A"
     
-    # Collect all wallets with payouts
-    all_wallets = set(combined_payouts.keys())
+    # Create quantizer for rounding ETH amounts
+    unit = Decimal(1) / (Decimal(10) ** eth_decimals)
+    
+    # Collect ALL wallets: those with payouts AND blacklisted wallets that were in leaderboards
+    all_wallets = set(combined_payouts.keys()) | blacklist
+    # Also include any wallet that appears in pre-blacklist rankings
+    all_wallets |= set(total_rank_map_pre.keys()) | set(best_rank_map_pre.keys())
     
     rows = []
     for wallet_lower in all_wallets:
-        total_rank, total_score = total_rank_map.get(wallet_lower, (None, Decimal(0)))
-        best_rank, best_score = best_rank_map.get(wallet_lower, (None, Decimal(0)))
+        is_blacklisted = wallet_lower in blacklist
         
-        total_payout = total_payouts.get(wallet_lower, Decimal(0))
-        best_payout = best_payouts.get(wallet_lower, Decimal(0))
-        combined = combined_payouts.get(wallet_lower, Decimal(0))
+        # Pre-blacklist data
+        total_rank_pre, total_score = total_rank_map_pre.get(wallet_lower, (None, Decimal(0)))
+        best_rank_pre, best_score = best_rank_map_pre.get(wallet_lower, (None, Decimal(0)))
+        
+        # Post-blacklist data (only if not blacklisted)
+        if is_blacklisted:
+            total_rank_post = None
+            best_rank_post = None
+        else:
+            total_rank_post, _ = total_rank_map.get(wallet_lower, (None, Decimal(0)))
+            best_rank_post, _ = best_rank_map.get(wallet_lower, (None, Decimal(0)))
+        
+        # Payouts (0 for blacklisted)
+        if is_blacklisted:
+            total_payout = Decimal(0)
+            best_payout = Decimal(0)
+            combined = Decimal(0)
+        else:
+            total_payout = total_payouts.get(wallet_lower, Decimal(0))
+            best_payout = best_payouts.get(wallet_lower, Decimal(0))
+            combined = combined_payouts.get(wallet_lower, Decimal(0))
+        
         wallet_credits = credits.get(wallet_lower, Decimal(0))
         
-        total_band = find_band(total_rank, "total") if total_rank else "N/A"
-        best_band = find_band(best_rank, "best") if best_rank else "N/A"
+        # Round ETH amounts to specified decimal places
+        total_payout_rounded = total_payout.quantize(unit, rounding=ROUND_HALF_UP)
+        best_payout_rounded = best_payout.quantize(unit, rounding=ROUND_HALF_UP)
+        combined_rounded = combined.quantize(unit, rounding=ROUND_HALF_UP)
+        
+        # Format ranks as separate columns
+        total_rank_pre_str = str(total_rank_pre) if total_rank_pre else "N/A"
+        total_rank_post_str = str(total_rank_post) if total_rank_post else ("BLACKLISTED" if is_blacklisted else "N/A")
+        best_rank_pre_str = str(best_rank_pre) if best_rank_pre else "N/A"
+        best_rank_post_str = str(best_rank_post) if best_rank_post else ("BLACKLISTED" if is_blacklisted else "N/A")
+        
+        # Band is based on post-blacklist rank (or N/A if blacklisted)
+        total_band = find_band(total_rank_post, "total") if total_rank_post else "N/A"
+        best_band = find_band(best_rank_post, "best") if best_rank_post else "N/A"
         
         rows.append((
             wallet_case.get(wallet_lower, wallet_lower),
-            str(combined),
-            str(total_rank) if total_rank else "N/A",
+            "YES" if is_blacklisted else "NO",
+            str(combined_rounded),
+            total_rank_pre_str,
+            total_rank_post_str,
             str(total_score) if total_score else "0",
             total_band,
-            str(total_payout),
-            str(best_rank) if best_rank else "N/A",
+            str(total_payout_rounded),
+            best_rank_pre_str,
+            best_rank_post_str,
             str(best_score) if best_score else "0",
             best_band,
-            str(best_payout),
+            str(best_payout_rounded),
             str(wallet_credits),
         ))
     
-    # Sort by combined payout desc
-    rows.sort(key=lambda x: Decimal(x[1]), reverse=True)
+    # Sort: blacklisted at end, then by combined payout desc
+    rows.sort(key=lambda x: (x[1] == "YES", -Decimal(x[2]) if x[2] != "0.0000" else Decimal(0), x[0]))
     
     with audit_path.open("w", newline="") as f:
         writer = csv.writer(f)
         writer.writerow([
             "wallet",
+            "blacklisted",
             "total_payout",
-            "total_runs_rank",
+            "total_runs_rank_pre_blacklist",
+            "total_runs_rank_post_blacklist",
             "total_runs_score",
             "total_runs_band",
             "total_runs_payout",
-            "best_run_rank",
+            "best_run_rank_pre_blacklist",
+            "best_run_rank_post_blacklist",
             "best_run_score",
             "best_run_band",
             "best_run_payout",
@@ -573,9 +632,9 @@ def write_xp_output(
         wallets &= hybrid_qualified
 
     # Aggregates
-    sum_total_runs = sum(total_runs.value_by_wallet_lower.get(w, Decimal(0)) for w in wallets)
-    sum_best_run = sum(best_run.value_by_wallet_lower.get(w, Decimal(0)) for w in wallets)
-    sum_spend = sum(spend_eth.get(w, Decimal(0)) for w in wallets)
+    sum_total_runs: Decimal = sum(total_runs.value_by_wallet_lower.get(w, Decimal(0)) for w in wallets) or Decimal(0)
+    sum_best_run: Decimal = sum(best_run.value_by_wallet_lower.get(w, Decimal(0)) for w in wallets) or Decimal(0)
+    sum_spend: Decimal = sum(spend_eth.get(w, Decimal(0)) for w in wallets) or Decimal(0)
 
     def safe_norm(val: Decimal, denom: Decimal) -> Decimal:
         return (val / denom) if denom > 0 else Decimal(0)
@@ -663,6 +722,10 @@ def main() -> None:
     # Convert to leaderboards and credits
     total_board, best_board, credits, wallet_case = load_and_prepare(inputs, args.min_credits)
 
+    # Rank leaderboards BEFORE blacklist removal (for audit comparison)
+    total_ranks_pre_blacklist = rank_wallets(total_board.value_by_wallet_lower)
+    best_ranks_pre_blacklist = rank_wallets(best_board.value_by_wallet_lower)
+
     # Apply blacklist to leaderboards and credits
     def remove_blacklisted(board: LeaderboardData) -> LeaderboardData:
         filtered_values = {w: v for w, v in board.value_by_wallet_lower.items() if w not in blacklist_wallets}
@@ -671,10 +734,10 @@ def main() -> None:
 
     total_board = remove_blacklisted(total_board)
     best_board = remove_blacklisted(best_board)
-    credits = {w: c for w, c in credits.items() if w not in blacklist_wallets}
+    credits_filtered = {w: c for w, c in credits.items() if w not in blacklist_wallets}
 
     # Qualified wallets by credits (for payout eligibility only)
-    qualified = qualify_wallets(credits, args.min_credits)
+    qualified = qualify_wallets(credits_filtered, args.min_credits)
 
     # Rank leaderboards AFTER blacklist removal, but BEFORE credit qualification (no re-ranking by eligibility)
     total_ranks = rank_wallets(total_board.value_by_wallet_lower)
@@ -714,6 +777,9 @@ def main() -> None:
                 eth_bands,
                 args.eth_total,
                 args.eth_decimals,
+                total_ranks_pre_blacklist,
+                best_ranks_pre_blacklist,
+                blacklist_wallets,
             )
             log("info", f"ETH audit report written: {audit_path}", log_level)
 
@@ -733,7 +799,7 @@ def main() -> None:
             total_board,
             best_board,
             spend_eth,
-            credits,
+            credits_filtered,
             xp_weights,
             qualified,
             args.xp_eligibility,
