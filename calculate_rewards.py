@@ -448,18 +448,25 @@ def finalize_eth_payouts(payouts: Dict[str, Decimal], target_total: Decimal, eth
     return rounded
 
 
-def write_eth_output(output_dir: pathlib.Path, season: str, date_tag: str, payouts: Dict[str, Decimal], wallet_case: Dict[str, str], eth_decimals: int, target_total: Decimal, target_winners: Optional[int]) -> pathlib.Path:
+def write_eth_output(output_dir: pathlib.Path, season: str, date_tag: str, payouts: Dict[str, Decimal], wallet_case: Dict[str, str], eth_decimals: int, target_total: Decimal, target_winners: Optional[int], best_ranks: List[Tuple[str, Decimal]]) -> pathlib.Path:
     # Round target_total for filename display (4 decimals is enough)
     display_total = float(target_total.quantize(Decimal("0.0001"), rounding=ROUND_HALF_UP))
     out_path = output_dir / f"{season}_{display_total}_eth-rewards_{eth_decimals}decimals_{date_tag}.csv"
     finalized = finalize_eth_payouts(payouts, target_total=target_total, eth_decimals=eth_decimals, target_winners=target_winners)
+    
+    # Build rank lookup for tiebreaking (lower rank = better)
+    # Use best_run rank as tiebreaker (performs better than total_runs)
+    rank_lookup: Dict[str, int] = {}
+    for rank, (wallet, _) in enumerate(best_ranks, start=1):
+        rank_lookup[wallet] = rank
+    
     rows: List[Tuple[str, str]] = []
     for w_lower, _un, rounded_amt in finalized:
         if rounded_amt <= 0:
             continue
         rows.append((wallet_case.get(w_lower, w_lower), str(rounded_amt)))
-    # sort by payout desc for readability
-    rows.sort(key=lambda x: Decimal(x[1]), reverse=True)
+    # Sort by payout desc, then by best_run rank asc (better rank first for ties)
+    rows.sort(key=lambda x: (-Decimal(x[1]), rank_lookup.get(x[0].lower(), 999999)))
     with out_path.open("w", newline="") as f:
         writer = csv.writer(f)
         writer.writerow(["wallet", "payout"])
@@ -879,7 +886,7 @@ def main() -> None:
         if not args.dry_run:
             # Calculate actual distributed amount (target minus forfeits)
             actual_distributed = Decimal(sum(all_payouts.values()))
-            eth_output_path = write_eth_output(output_dir, season, date_tag, all_payouts, wallet_case, args.eth_decimals, actual_distributed, args.eth_target_winners)
+            eth_output_path = write_eth_output(output_dir, season, date_tag, all_payouts, wallet_case, args.eth_decimals, actual_distributed, args.eth_target_winners, best_ranks)
             # Generate audit report
             audit_path = write_eth_audit(
                 output_dir,
