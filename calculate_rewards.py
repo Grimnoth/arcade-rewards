@@ -557,6 +557,15 @@ def write_eth_audit(
         total_band = find_band(total_rank_post, "total") if total_rank_post else "N/A"
         best_band = find_band(best_rank_post, "best") if best_rank_post else "N/A"
         
+        # Determine best pre-blacklist rank for sorting (lower number = better rank)
+        best_pre_rank = float('inf')
+        if total_rank_pre is not None:
+            best_pre_rank = min(best_pre_rank, total_rank_pre)
+        if best_rank_pre is not None:
+            best_pre_rank = min(best_pre_rank, best_rank_pre)
+        if best_pre_rank == float('inf'):
+            best_pre_rank = 999999  # Put wallets with no ranking at the end
+        
         rows.append((
             wallet_case.get(wallet_lower, wallet_lower),
             "YES" if is_blacklisted else "NO",
@@ -572,10 +581,45 @@ def write_eth_audit(
             best_band,
             str(best_payout_rounded),
             str(wallet_credits),
+            best_pre_rank,  # Add for sorting
         ))
     
-    # Sort: blacklisted at end, then by combined payout desc
-    rows.sort(key=lambda x: (x[1] == "YES", -Decimal(x[2]) if x[2] != "0.0000" else Decimal(0), x[0]))
+    # Sort non-blacklisted by payout first
+    non_blacklisted = [row for row in rows if row[1] == "NO"]
+    blacklisted = [row for row in rows if row[1] == "YES"]
+    
+    # Sort non-blacklisted by payout desc
+    non_blacklisted.sort(key=lambda x: (-Decimal(x[2]) if x[2] != "0.0000" else Decimal(0), x[0]))
+    
+    # For each blacklisted wallet, find where to insert it based on pre-blacklist rank
+    # Insert it right before the wallet that has a similar or worse pre-rank
+    result_rows = []
+    blacklisted_by_rank = sorted(blacklisted, key=lambda x: x[14])  # Sort blacklisted by their pre-rank
+    
+    blacklisted_idx = 0
+    for row in non_blacklisted:
+        # Insert any blacklisted wallets that should appear before this row
+        while blacklisted_idx < len(blacklisted_by_rank):
+            bl_wallet = blacklisted_by_rank[blacklisted_idx]
+            bl_pre_rank = bl_wallet[14]
+            current_pre_rank = row[14]
+            
+            # If the blacklisted wallet had a better pre-rank, insert it before this row
+            if bl_pre_rank < current_pre_rank:
+                result_rows.append(bl_wallet)
+                blacklisted_idx += 1
+            else:
+                break
+        
+        result_rows.append(row)
+    
+    # Add any remaining blacklisted wallets at the end
+    while blacklisted_idx < len(blacklisted_by_rank):
+        result_rows.append(blacklisted_by_rank[blacklisted_idx])
+        blacklisted_idx += 1
+    
+    # Remove the sorting helper column before writing
+    rows = [row[:14] for row in result_rows]
     
     with audit_path.open("w", newline="") as f:
         writer = csv.writer(f)
